@@ -7,6 +7,8 @@ Notes:
 '''
 
 
+from pyexpat import model
+
 import torch
 
 import face_recognition
@@ -38,6 +40,17 @@ def detect_faces(img: torch.Tensor) -> List[List[float]]:
     detection_results: List[List[float]] = []
 
     ##### YOUR IMPLEMENTATION STARTS HERE #####
+    #print(img.dtype)
+    #print(img.shape)
+    img_np = img.permute(1, 2, 0).to(torch.uint8).numpy() # Convert tensor to numpy array for face_recognition. Dimensions are CxHxW, but face_recognition expects HxWxC. Also convert to uint8 for face_recognition.
+    face_locations = face_recognition.face_locations(img_np, model = "hog") # Detect faces using face_recognition
+    
+    for (top, right, bottom, left) in face_locations:
+        box_width = right - left
+        box_height = bottom - top
+        # left = x
+        # top = y
+        detection_results.append([float(left), float(top), float(box_width), float(box_height)]) # Append detected bounding box to results
 
     return detection_results
 
@@ -66,6 +79,62 @@ def cluster_faces(imgs: Dict[str, torch.Tensor], K: int) -> List[List[str]]:
         
     ##### YOUR IMPLEMENTATION STARTS HERE #####
     
+    #Get face encodings for each image
+    encodings = []
+    filenames = []
+
+    for img_name, img_tensor in imgs.items():
+        img_np = img_tensor.permute(1, 2, 0).to(torch.uint8).numpy() # Convert tensor to numpy array for face_recognition. Dimensions are CxHxW, but face_recognition expects HxWxC. Also convert to uint8 for face_recognition.
+        face_locations = face_recognition.face_locations(img_np, model = "hog") # Detect faces using face_recognition
+        if len(face_locations) == 0:
+            # Use full image for images with no faces detected
+            face_locations = [(0, img_np.shape[1], img_np.shape[0], 0)]
+
+        enc_list = face_recognition.face_encodings(img_np, face_locations)
+        if len(enc_list) == 0:
+            # If no encodings are found, use a zero vector
+            encoding = torch.zeros(128)
+        else:
+            encoding = torch.tensor(enc_list[0]) # Use the first face encoding for clustering
+        filenames.append(img_name)
+        encodings.append(encoding)
+    
+    N = len(encodings)
+    encodings_tensor = torch.stack(encodings) # Stack encodings into a tensor of shape (N, 128)
+    if N == 0:
+        return cluster_results # Return empty clusters
+    
+    #Next: K-means clustering on the encodings
+
+    # Initialize cluster centers randomly from the encodings
+    indices = torch.randperm(N)[:K]
+    centers = encodings_tensor[indices] # Shape (K, 128)
+
+    iterations = 100 # Number of iterations for K-means
+    prev_clusters = torch.full((N,), -1, dtype=torch.long) # Initialize previous cluster assignments to -1
+    for _ in range(iterations):
+        # Compute distances from encodings to cluster centers
+        distances = torch.cdist(encodings_tensor, centers) # Shape (N, K)
+        closest_clusters = torch.argmin(distances, dim=1) # Shape (N,)
+        if torch.all(closest_clusters == prev_clusters): # If cluster assignments do not change, we have converged
+            break
+        prev_clusters = closest_clusters.clone()
+        # Update cluster centers
+        new_centers = []
+        for k in range(K):
+            cluster_points = encodings_tensor[closest_clusters == k]
+            if len(cluster_points) > 0:
+                new_centers.append(cluster_points.mean(dim=0))
+            else:
+                new_centers.append(centers[k])   # keep old center if empty
+        centers = torch.stack(new_centers) # Shape (K, 128)
+    labels = closest_clusters
+
+    #Now build cluster results based on labels
+
+    for i, fileName in enumerate(filenames):
+        cluster_idx = labels[i].item()
+        cluster_results[cluster_idx].append(fileName)
     return cluster_results
 
 
@@ -75,3 +144,19 @@ But remember the above 2 functions are the only functions that will be called by
 '''
 
 # TODO: Your functions. (if needed)
+
+def pairwise_squared_euclidean_distance(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    Compute pairwise squared Euclidean distance between two sets of vectors.
+    Args:
+        x: Tensor of shape (N, D)
+        y: Tensor of shape (M, D)
+    Returns:
+        distances: Tensor of shape (N, M) where distances[i][j] is the squared Euclidean distance between x[i] and y[j].
+    """
+    # Using broadcasting to compute pairwise distances
+    x_squared = torch.sum(x**2, dim=1).unsqueeze(1)  # Shape (N, 1)
+    y_squared = torch.sum(y**2, dim=1).unsqueeze(0)  # Shape (1, M)
+    cross_term = torch.mm(x, y.t())  # Shape (N, M)
+    distances = x_squared + y_squared - 2 * cross_term  # Shape (N, M)
+    return distances.clamp(min=0)  # Ensure non-negative distances
